@@ -1006,4 +1006,4 @@ class SpeakerVerification:
 
 ## 次へ
 
-[推薦システム](../推薦システム/README.md)へ進む
+[推薦システム](../04_推薦システム/README.md)へ進む

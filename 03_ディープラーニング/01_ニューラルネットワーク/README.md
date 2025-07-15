@@ -558,4 +558,4 @@ print("バッチ正規化モデルの最終精度:", history_bn.history['val_acc
 
 ## 次へ
 
-[CNN（畳み込みニューラルネットワーク）](../CNN/README.md)へ進む
+[CNN（畳み込みニューラルネットワーク）](../02_CNN/README.md)へ進む

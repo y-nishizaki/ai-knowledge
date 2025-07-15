@@ -794,4 +794,4 @@ def print_memory_usage():
 
 ## 次へ
 
-[MLOps入門](../MLOps/README.md)へ進む
+[MLOps入門](../04_MLOps/README.md)へ進む

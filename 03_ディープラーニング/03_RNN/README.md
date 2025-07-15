@@ -687,4 +687,4 @@ RNNとその発展形について学びました：
 
 ## 次へ
 
-[Transformer](../Transformer/README.md)へ進む
+[Transformer](../04_Transformer/README.md)へ進む

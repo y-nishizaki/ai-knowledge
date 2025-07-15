@@ -733,4 +733,4 @@ Transformerは現在のNLPの基盤技術であり、BERT、GPT、T5などの強
 
 ## 次へ
 
-[AI開発の実践](../../実践/README.md)へ進む
+[AI開発の実践](../../04_実践/README.md)へ進む
