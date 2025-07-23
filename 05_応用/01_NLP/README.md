@@ -831,23 +831,35 @@ def create_cot_prompt(question):
 
 ### RAG（Retrieval-Augmented Generation）
 
+RAG（Retrieval-Augmented Generation）は、大規模言語モデル（LLM）の知識制限を克服するための革新的な技術です。外部の知識ベースから関連情報を検索し、それをコンテキストとして生成に活用することで、より正確で最新の情報に基づいた回答を生成できます。
+
+#### RAGの基本概念
+
 ```python
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
+from typing import List, Dict, Any
+import json
 
 class RAGSystem:
     def __init__(self, embedding_model='sentence-transformers/all-MiniLM-L6-v2'):
         self.embedding_model = SentenceTransformer(embedding_model)
         self.index = None
         self.documents = []
+        self.metadata = []
     
-    def add_documents(self, documents):
+    def add_documents(self, documents: List[str], metadata: List[Dict] = None):
         """ドキュメントをインデックスに追加"""
         self.documents.extend(documents)
         
+        if metadata:
+            self.metadata.extend(metadata)
+        else:
+            self.metadata.extend([{"id": i, "source": "unknown"} for i in range(len(documents))])
+        
         # 埋め込みベクトルの生成
-        embeddings = self.embedding_model.encode(documents)
+        embeddings = self.embedding_model.encode(documents, show_progress_bar=True)
         
         # FAISSインデックスの作成
         if self.index is None:
@@ -856,7 +868,7 @@ class RAGSystem:
         
         self.index.add(embeddings.astype('float32'))
     
-    def retrieve(self, query, k=3):
+    def retrieve(self, query: str, k: int = 3, threshold: float = 0.7) -> List[Dict]:
         """関連ドキュメントの検索"""
         query_embedding = self.embedding_model.encode([query])
         
@@ -864,22 +876,57 @@ class RAGSystem:
             query_embedding.astype('float32'), k
         )
         
-        retrieved_docs = [self.documents[idx] for idx in indices[0]]
-        return retrieved_docs
+        results = []
+        for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
+            # 類似度スコアの計算（距離を類似度に変換）
+            similarity = 1 / (1 + distance)
+            
+            if similarity >= threshold:
+                results.append({
+                    "document": self.documents[idx],
+                    "metadata": self.metadata[idx],
+                    "similarity": similarity,
+                    "rank": i + 1
+                })
+        
+        return results
     
-    def generate_with_context(self, query, generator_model):
+    def generate_with_context(self, query: str, generator_model, 
+                            max_context_length: int = 2000) -> Dict[str, Any]:
         """検索結果を使った生成"""
         # 関連ドキュメントの検索
-        context_docs = self.retrieve(query)
+        retrieved_docs = self.retrieve(query, k=5)
         
-        # コンテキストの作成
-        context = "\n".join([f"参考情報{i+1}: {doc}" 
-                           for i, doc in enumerate(context_docs)])
+        if not retrieved_docs:
+            return {
+                "query": query,
+                "context": "",
+                "answer": "関連する情報が見つかりませんでした。",
+                "sources": []
+            }
+        
+        # コンテキストの作成（長さ制限付き）
+        context_parts = []
+        sources = []
+        current_length = 0
+        
+        for doc in retrieved_docs:
+            doc_text = f"参考情報{doc['rank']}: {doc['document']}"
+            if current_length + len(doc_text) <= max_context_length:
+                context_parts.append(doc_text)
+                sources.append(doc['metadata'])
+                current_length += len(doc_text)
+            else:
+                break
+        
+        context = "\n".join(context_parts)
         
         # プロンプトの作成
         prompt = f"""
-以下の参考情報を基に、質問に答えてください。
+以下の参考情報を基に、質問に正確に答えてください。
+参考情報に含まれていない内容については「情報が不足しています」と答えてください。
 
+参考情報:
 {context}
 
 質問: {query}
@@ -890,18 +937,444 @@ class RAGSystem:
         # 生成（実際のモデル呼び出しは省略）
         # response = generator_model.generate(prompt)
         
-        return prompt  # 実際はresponseを返す
+        return {
+            "query": query,
+            "context": context,
+            "prompt": prompt,
+            "sources": sources,
+            "retrieved_docs": retrieved_docs
+        }
+
+# 高度なRAGシステム
+class AdvancedRAGSystem(RAGSystem):
+    def __init__(self, embedding_model='sentence-transformers/all-MiniLM-L6-v2'):
+        super().__init__(embedding_model)
+        self.chunk_size = 512
+        self.chunk_overlap = 50
+    
+    def chunk_document(self, text: str) -> List[str]:
+        """長いドキュメントをチャンクに分割"""
+        chunks = []
+        words = text.split()
+        
+        for i in range(0, len(words), self.chunk_size - self.chunk_overlap):
+            chunk = " ".join(words[i:i + self.chunk_size])
+            if chunk.strip():
+                chunks.append(chunk)
+        
+        return chunks
+    
+    def add_large_documents(self, documents: List[str], metadata: List[Dict] = None):
+        """大きなドキュメントをチャンク分割して追加"""
+        all_chunks = []
+        all_metadata = []
+        
+        for i, doc in enumerate(documents):
+            chunks = self.chunk_document(doc)
+            all_chunks.extend(chunks)
+            
+            if metadata and i < len(metadata):
+                doc_metadata = metadata[i].copy()
+                for j, chunk in enumerate(chunks):
+                    chunk_metadata = doc_metadata.copy()
+                    chunk_metadata["chunk_id"] = j
+                    chunk_metadata["total_chunks"] = len(chunks)
+                    all_metadata.append(chunk_metadata)
+            else:
+                for j, chunk in enumerate(chunks):
+                    all_metadata.append({
+                        "id": f"{i}_{j}",
+                        "source": "unknown",
+                        "chunk_id": j,
+                        "total_chunks": len(chunks)
+                    })
+        
+        self.add_documents(all_chunks, all_metadata)
+    
+    def hybrid_search(self, query: str, k: int = 3, 
+                     dense_weight: float = 0.7) -> List[Dict]:
+        """ハイブリッド検索（密ベクトル + スパースベクトル）"""
+        # 密ベクトル検索（既存の実装）
+        dense_results = self.retrieve(query, k=k*2)
+        
+        # スパースベクトル検索（BM25など）
+        sparse_results = self.bm25_search(query, k=k*2)
+        
+        # 結果の統合
+        combined_results = self.combine_results(
+            dense_results, sparse_results, dense_weight
+        )
+        
+        return combined_results[:k]
+    
+    def bm25_search(self, query: str, k: int = 3) -> List[Dict]:
+        """BM25によるスパースベクトル検索"""
+        # 簡易的なBM25実装
+        from collections import Counter
+        import math
+        
+        query_terms = query.lower().split()
+        
+        # ドキュメントのTF-IDF計算
+        scores = []
+        for i, doc in enumerate(self.documents):
+            doc_terms = doc.lower().split()
+            doc_term_freq = Counter(doc_terms)
+            
+            score = 0
+            for term in query_terms:
+                if term in doc_term_freq:
+                    # 簡易BM25スコア
+                    tf = doc_term_freq[term]
+                    score += tf / (tf + 1.5)
+            
+            if score > 0:
+                scores.append({
+                    "document": doc,
+                    "metadata": self.metadata[i],
+                    "similarity": score,
+                    "rank": 0
+                })
+        
+        # スコアでソート
+        scores.sort(key=lambda x: x["similarity"], reverse=True)
+        return scores[:k]
+    
+    def combine_results(self, dense_results: List[Dict], 
+                       sparse_results: List[Dict], 
+                       dense_weight: float) -> List[Dict]:
+        """検索結果の統合"""
+        combined = {}
+        
+        # 密ベクトル結果の追加
+        for result in dense_results:
+            doc_id = result["metadata"].get("id", result["document"][:50])
+            combined[doc_id] = {
+                "document": result["document"],
+                "metadata": result["metadata"],
+                "dense_score": result["similarity"],
+                "sparse_score": 0.0,
+                "combined_score": result["similarity"] * dense_weight
+            }
+        
+        # スパースベクトル結果の追加
+        for result in sparse_results:
+            doc_id = result["metadata"].get("id", result["document"][:50])
+            if doc_id in combined:
+                combined[doc_id]["sparse_score"] = result["similarity"]
+                combined[doc_id]["combined_score"] += result["similarity"] * (1 - dense_weight)
+            else:
+                combined[doc_id] = {
+                    "document": result["document"],
+                    "metadata": result["metadata"],
+                    "dense_score": 0.0,
+                    "sparse_score": result["similarity"],
+                    "combined_score": result["similarity"] * (1 - dense_weight)
+                }
+        
+        # 統合スコアでソート
+        sorted_results = sorted(
+            combined.values(), 
+            key=lambda x: x["combined_score"], 
+            reverse=True
+        )
+        
+        return sorted_results
 
 # 使用例
-rag = RAGSystem()
-rag.add_documents([
-    "人工知能は機械が人間の知能を模倣する技術です。",
-    "機械学習はデータから学習するAIの一分野です。",
-    "深層学習は多層のニューラルネットワークを使用します。"
-])
+def create_sample_rag_system():
+    """サンプルRAGシステムの作成"""
+    rag = AdvancedRAGSystem()
+    
+    # サンプルドキュメント
+    documents = [
+        "人工知能（AI）は、機械が人間の知能を模倣する技術です。機械学習、深層学習、自然言語処理などの分野を含みます。",
+        "機械学習は、データから学習して予測や分類を行うAIの一分野です。教師あり学習、教師なし学習、強化学習に分類されます。",
+        "深層学習は、多層のニューラルネットワークを使用した機械学習手法です。画像認識、音声認識、自然言語処理で高い性能を発揮します。",
+        "自然言語処理（NLP）は、人間の言語をコンピュータが理解・生成する技術です。テキスト分類、機械翻訳、質問応答システムなどがあります。",
+        "Transformerは、2017年に発表された自然言語処理の革新的なアーキテクチャです。Attention機構により長距離依存関係を効率的に学習できます。",
+        "RAG（Retrieval-Augmented Generation）は、外部知識ベースから情報を検索し、それを基に回答を生成する技術です。LLMの知識制限を克服できます。"
+    ]
+    
+    metadata = [
+        {"id": "ai_intro", "source": "AI基礎", "category": "overview"},
+        {"id": "ml_basics", "source": "機械学習", "category": "learning"},
+        {"id": "dl_intro", "source": "深層学習", "category": "neural_networks"},
+        {"id": "nlp_basics", "source": "NLP", "category": "language"},
+        {"id": "transformer", "source": "アーキテクチャ", "category": "model"},
+        {"id": "rag_intro", "source": "RAG", "category": "generation"}
+    ]
+    
+    rag.add_documents(documents, metadata)
+    return rag
 
-# query = "深層学習について教えて"
-# context = rag.generate_with_context(query, None)
+# 実際の使用例
+# rag_system = create_sample_rag_system()
+# 
+# # 質問応答
+# query = "深層学習と機械学習の違いを教えて"
+# result = rag_system.generate_with_context(query, None)
+# 
+# print("質問:", result["query"])
+# print("検索されたドキュメント数:", len(result["retrieved_docs"]))
+# print("コンテキスト:", result["context"][:200] + "...")
+# print("プロンプト:", result["prompt"][:300] + "...")
+```
+
+#### RAGの応用例
+
+```python
+# ドキュメント検索システム
+class DocumentSearchRAG:
+    def __init__(self):
+        self.rag = AdvancedRAGSystem()
+        self.document_store = {}
+    
+    def add_document(self, doc_id: str, content: str, metadata: Dict = None):
+        """ドキュメントの追加"""
+        self.document_store[doc_id] = {
+            "content": content,
+            "metadata": metadata or {}
+        }
+        
+        # チャンク分割してRAGシステムに追加
+        chunks = self.rag.chunk_document(content)
+        chunk_metadata = []
+        for i, chunk in enumerate(chunks):
+            chunk_meta = metadata.copy() if metadata else {}
+            chunk_meta.update({
+                "doc_id": doc_id,
+                "chunk_id": i,
+                "total_chunks": len(chunks)
+            })
+            chunk_metadata.append(chunk_meta)
+        
+        self.rag.add_documents(chunks, chunk_metadata)
+    
+    def search_and_answer(self, query: str, max_sources: int = 3) -> Dict:
+        """検索と回答生成"""
+        # ハイブリッド検索
+        results = self.rag.hybrid_search(query, k=max_sources*2)
+        
+        # ソースの整理
+        sources = []
+        seen_docs = set()
+        
+        for result in results:
+            doc_id = result["metadata"]["doc_id"]
+            if doc_id not in seen_docs and len(sources) < max_sources:
+                sources.append({
+                    "doc_id": doc_id,
+                    "content": result["document"],
+                    "similarity": result["combined_score"],
+                    "metadata": result["metadata"]
+                })
+                seen_docs.add(doc_id)
+        
+        # 回答生成
+        context = "\n".join([f"参考{i+1}: {source['content']}" 
+                           for i, source in enumerate(sources)])
+        
+        prompt = f"""
+以下の参考情報を基に、質問に正確に答えてください。
+参考情報に含まれていない内容については「情報が不足しています」と答えてください。
+
+参考情報:
+{context}
+
+質問: {query}
+
+回答:
+"""
+        
+        return {
+            "query": query,
+            "answer_prompt": prompt,
+            "sources": sources,
+            "total_results": len(results)
+        }
+
+# チャットボット用RAG
+class ChatbotRAG:
+    def __init__(self):
+        self.rag = AdvancedRAGSystem()
+        self.conversation_history = []
+    
+    def add_knowledge_base(self, documents: List[str], metadata: List[Dict] = None):
+        """知識ベースの追加"""
+        self.rag.add_large_documents(documents, metadata)
+    
+    def chat(self, user_message: str, max_history: int = 5) -> Dict:
+        """チャット応答"""
+        # 会話履歴の管理
+        self.conversation_history.append({"role": "user", "content": user_message})
+        
+        if len(self.conversation_history) > max_history * 2:
+            # 古い履歴を削除（最新のmax_history分を保持）
+            self.conversation_history = self.conversation_history[-max_history * 2:]
+        
+        # 検索クエリの作成（会話履歴を考慮）
+        search_query = self._create_search_query(user_message)
+        
+        # RAG検索
+        retrieved_docs = self.rag.retrieve(search_query, k=3)
+        
+        # 会話履歴と検索結果を組み合わせたプロンプト
+        context = self._create_conversation_context(retrieved_docs)
+        
+        prompt = f"""
+あなたは知識豊富なアシスタントです。以下の会話履歴と参考情報を基に、自然で有用な回答を提供してください。
+
+{context}
+
+最新の質問: {user_message}
+
+回答:
+"""
+        
+        # 回答生成（実際のモデル呼び出しは省略）
+        # response = self._generate_response(prompt)
+        
+        # 会話履歴に回答を追加
+        # self.conversation_history.append({"role": "assistant", "content": response})
+        
+        return {
+            "user_message": user_message,
+            "search_query": search_query,
+            "retrieved_docs": retrieved_docs,
+            "prompt": prompt,
+            "conversation_length": len(self.conversation_history)
+        }
+    
+    def _create_search_query(self, user_message: str) -> str:
+        """検索クエリの作成"""
+        # 会話履歴から重要な情報を抽出
+        recent_context = ""
+        for msg in self.conversation_history[-4:]:  # 最新2往復分
+            if msg["role"] == "user":
+                recent_context += f" {msg['content']}"
+        
+        # 現在の質問と履歴を組み合わせ
+        search_query = f"{recent_context} {user_message}".strip()
+        return search_query
+    
+    def _create_conversation_context(self, retrieved_docs: List[Dict]) -> str:
+        """会話コンテキストの作成"""
+        context_parts = []
+        
+        # 参考情報
+        if retrieved_docs:
+            context_parts.append("参考情報:")
+            for i, doc in enumerate(retrieved_docs):
+                context_parts.append(f"{i+1}. {doc['document']}")
+        
+        # 会話履歴
+        if len(self.conversation_history) > 1:
+            context_parts.append("\n会話履歴:")
+            for msg in self.conversation_history[-6:]:  # 最新3往復分
+                role = "ユーザー" if msg["role"] == "user" else "アシスタント"
+                context_parts.append(f"{role}: {msg['content']}")
+        
+        return "\n".join(context_parts)
+```
+
+#### RAGの評価指標
+
+```python
+class RAGEvaluator:
+    def __init__(self):
+        self.metrics = {}
+    
+    def evaluate_retrieval(self, query: str, retrieved_docs: List[Dict], 
+                          relevant_docs: List[str]) -> Dict[str, float]:
+        """検索性能の評価"""
+        retrieved_texts = [doc["document"] for doc in retrieved_docs]
+        
+        # Precision@K
+        relevant_retrieved = sum(1 for doc in retrieved_texts 
+                               if any(self._is_relevant(doc, rel) for rel in relevant_docs))
+        precision_at_k = relevant_retrieved / len(retrieved_texts) if retrieved_texts else 0
+        
+        # Recall@K
+        total_relevant = len(relevant_docs)
+        recall_at_k = relevant_retrieved / total_relevant if total_relevant > 0 else 0
+        
+        # F1@K
+        f1_at_k = 2 * (precision_at_k * recall_at_k) / (precision_at_k + recall_at_k) \
+                  if (precision_at_k + recall_at_k) > 0 else 0
+        
+        return {
+            "precision_at_k": precision_at_k,
+            "recall_at_k": recall_at_k,
+            "f1_at_k": f1_at_k,
+            "relevant_retrieved": relevant_retrieved,
+            "total_retrieved": len(retrieved_texts),
+            "total_relevant": total_relevant
+        }
+    
+    def evaluate_generation(self, generated_answer: str, 
+                          reference_answer: str) -> Dict[str, float]:
+        """生成性能の評価"""
+        # BLEUスコア（簡易版）
+        from collections import Counter
+        
+        def get_ngrams(text, n):
+            words = text.split()
+            return Counter([' '.join(words[i:i+n]) for i in range(len(words)-n+1)])
+        
+        # 1-gramと2-gramのBLEU
+        gen_1grams = get_ngrams(generated_answer, 1)
+        gen_2grams = get_ngrams(generated_answer, 2)
+        ref_1grams = get_ngrams(reference_answer, 1)
+        ref_2grams = get_ngrams(reference_answer, 2)
+        
+        # 1-gram precision
+        overlap_1gram = sum((gen_1grams & ref_1grams).values())
+        precision_1gram = overlap_1gram / sum(gen_1grams.values()) if gen_1grams else 0
+        
+        # 2-gram precision
+        overlap_2gram = sum((gen_2grams & ref_2grams).values())
+        precision_2gram = overlap_2gram / sum(gen_2grams.values()) if gen_2grams else 0
+        
+        # 簡易BLEU
+        bleu_score = (precision_1gram + precision_2gram) / 2
+        
+        return {
+            "bleu_score": bleu_score,
+            "precision_1gram": precision_1gram,
+            "precision_2gram": precision_2gram,
+            "generated_length": len(generated_answer.split()),
+            "reference_length": len(reference_answer.split())
+        }
+    
+    def _is_relevant(self, retrieved_doc: str, relevant_doc: str) -> bool:
+        """関連性判定（簡易版）"""
+        # 実際の実装では、より高度な類似度計算を使用
+        retrieved_words = set(retrieved_doc.lower().split())
+        relevant_words = set(relevant_doc.lower().split())
+        
+        overlap = len(retrieved_words & relevant_words)
+        union = len(retrieved_words | relevant_words)
+        
+        return overlap / union > 0.3 if union > 0 else False
+
+# 使用例
+# evaluator = RAGEvaluator()
+# 
+# # 検索評価
+# query = "深層学習について"
+# retrieved_docs = [{"document": "深層学習は多層のニューラルネットワーク..."}]
+# relevant_docs = ["深層学習は多層のニューラルネットワークを使用する技術"]
+# 
+# retrieval_metrics = evaluator.evaluate_retrieval(query, retrieved_docs, relevant_docs)
+# print("検索評価:", retrieval_metrics)
+# 
+# # 生成評価
+# generated = "深層学習は多層のニューラルネットワークを使用した機械学習手法です。"
+# reference = "深層学習は多層のニューラルネットワークを使った学習方法です。"
+# 
+# generation_metrics = evaluator.evaluate_generation(generated, reference)
+# print("生成評価:", generation_metrics)
 ```
 
 ## まとめ
